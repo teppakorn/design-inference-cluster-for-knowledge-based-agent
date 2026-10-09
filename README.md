@@ -1,4 +1,22 @@
-# pd-vllm-gateway
+# Design Inference Cluster in Knowledge-based Agent
+
+![Open WebUI on this stack: the agent searches the wiki with search_wiki, reads two notes with read_note, and answers with a dated timeline](docs/screenshot-ui.PNG)
+
+*The chat page (Open WebUI) on this stack: the model calls `search_wiki`, opens the notes with `read_note`, and answers with a dated, cited timeline.*
+
+## Architecture
+
+| Part | Decision | Why |
+| :--- | :--- | :--- |
+| Northbound | No fallback to an external API | No data leaves the cluster |
+| Admission | Token bucket per tenant + fleet health + SLO deadline | Turns away work it cannot serve, so overload does not take the whole system down |
+| Queue | Two classes (short / long prompts, 9:1) | Long prompts cannot block the short ones (head-of-line blocking) |
+| Router | Prefix-aware routing with a load bound | Keeps the E2E latency of agent calls in a narrow range |
+| Cache | KV offloading to Mooncake (LRU eviction) | Good TTFT in multi-turn conversations |
+| Engine | vLLM | More efficient KV-cache use than SGLang for this workload |
+| Pod | Prefill/decode disaggregation | Aggregated (normal) pods showed more variance in E2E latency |
+| Device | HAMi | Splits one GPU into slices, so the prefill and decode pods can share it |
+| Scaling | KEDA (planned; this repo runs a fixed 2 prefill + 2 decode) | Start with 2 pods (1 prefill, 1 decode) and scale on in-flight requests |
 
 Serve an LLM on **one GPU box** with **prefill/decode disaggregation**, behind a small gateway
 that decides **who gets in, who goes next, and where each request runs**.
