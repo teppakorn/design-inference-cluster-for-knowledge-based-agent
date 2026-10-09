@@ -1,0 +1,24 @@
+# Grafana: dashboards come from ConfigMaps labelled grafana_dashboard=1 (scripts/dashboards.sh).
+# Reach it through an SSH tunnel to port 31495 (see README); do not open that port to the internet.
+persistence:
+  enabled: false
+service:
+  type: NodePort
+  nodePort: 31495
+sidecar:
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
+    searchNamespace: ALL
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        url: http://prometheus-server.monitoring.svc.cluster.local:80
+        access: proxy
+        isDefault: true
+        editable: true

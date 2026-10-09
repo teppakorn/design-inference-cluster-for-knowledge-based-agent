@@ -1,0 +1,2 @@
+# keep LF everywhere: the scripts run on Linux
+* text=auto eol=lf

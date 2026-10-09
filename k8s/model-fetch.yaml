@@ -1,0 +1,27 @@
+# Download the model once into the node's shared Hugging Face cache before any vLLM pod starts,
+# so four pods do not race to download the same weights.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-fetch
+  labels: {stack: pd-gateway}
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: {app: model-fetch}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fetch
+          image: ${VLLM_IMAGE}
+          command: ["hf", "download", "${MODEL}"]
+          env:
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}
+          volumeMounts:
+            - {name: hf-cache, mountPath: /root/.cache/huggingface}
+      volumes:
+        - name: hf-cache
+          hostPath: {path: "${HF_CACHE_DIR}", type: DirectoryOrCreate}

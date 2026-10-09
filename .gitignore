@@ -1,0 +1,9 @@
+# secrets and local overrides
+.env
+# per-request traces and load-test output
+traces/
+*.jsonl
+# Python
+__pycache__/
+*.pyc
+.venv/

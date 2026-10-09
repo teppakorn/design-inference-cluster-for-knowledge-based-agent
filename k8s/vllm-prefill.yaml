@@ -1,0 +1,112 @@
+# Prefill pool: plain vLLM, no sidecar. The decode pod's llm-d sidecar calls it directly
+# (max_tokens=1, kv_transfer_params.do_remote_decode=true).
+#
+# KV connectors (MultiConnector: the first that has the blocks loads them, every connector saves):
+#   1. NIXL (kv_producer)               NixlPushConnector: WRITEs the finished prompt KV into the
+#                                       blocks the decode pod registered (CUDA IPC on one GPU)
+#   2. MooncakeStoreConnector (kv_both) parks every computed block in the shared Mooncake pool and
+#                                       loads prefix hits from it, so a prompt prefilled on prefill-0
+#                                       is a cache hit on prefill-1
+#
+# Rendered once per prefill_set (config.sh). MOONCAKE_RDMA=1 (default): two 1-replica Deployments
+# vllm-prefill-0/1 on the host network, ports 18100/18101, NIXL side channel 15600/15601 (they share
+# the node IP). MOONCAKE_RDMA=0: one Deployment vllm-prefill with 2 replicas on the pod network.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${PREFILL_NAME}
+  labels: {app: vllm-prefill, stack: pd-gateway, role: prefill, prefill-set: ${PREFILL_NAME}}
+spec:
+  replicas: ${PREFILL_REPLICAS}
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: vllm-prefill, prefill-set: ${PREFILL_NAME}}
+  template:
+    metadata:
+      labels: {app: vllm-prefill, stack: pd-gateway, role: prefill, prefill-set: ${PREFILL_NAME}}
+      annotations:
+        nvidia.com/use-gpuuuid: "${GPU_UUID}"   # all 4 slices on ONE GPU (HAMi)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "${PREFILL_PORT}"
+        prometheus.io/path: /metrics
+    spec:
+      schedulerName: hami-scheduler
+      hostNetwork: ${PREFILL_HOST_NETWORK}
+      dnsPolicy: ${PREFILL_DNS_POLICY}   # ClusterFirstWithHostNet: still resolves mooncake-master
+      # CUDA IPC between pods on the same GPU needs the host IPC + PID namespaces
+      hostIPC: ${PD_HOST_NS}
+      hostPID: ${PD_HOST_NS}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          # MOONCAKE_RDMA=1: /dev/infiniband + pinned memory for Mooncake's RDMA transport
+          securityContext: {privileged: ${MOONCAKE_PRIVILEGED}}
+          args:
+            - ${MODEL}
+            - --served-model-name=${SERVED_MODEL_NAME}
+            - --host=0.0.0.0
+            - --port=${PREFILL_PORT}
+            - --max-num-seqs=${MAX_NUM_SEQS}
+            - --enable-chunked-prefill
+            - --max-num-batched-tokens=${MAX_NUM_BATCHED_TOKENS}
+            - --enable-prefix-caching
+            - --max-model-len=${MAX_MODEL_LEN}
+            - --gpu-memory-utilization=${GPU_MEM_UTIL}
+            - --enable-auto-tool-choice
+            - --tool-call-parser=${TOOL_PARSER}
+            - --enable-prompt-tokens-details
+            - --disable-access-log-for-endpoints=/health,/metrics,/v1/models
+            ${VLLM_EXTRA_ARGS_YAML}
+            - '--kv-transfer-config=${PREFILL_KV_CONFIG}'
+          env:
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: VLLM_NIXL_SIDE_CHANNEL_PORT, value: "${PREFILL_NIXL_PORT}"}
+            # vLLM's 5 s keep-alive is shorter than the Go sidecar's idle pool -> connection resets
+            - {name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE, value: "120"}
+            - {name: PYTHONHASHSEED, value: "0"}
+            - {name: VLLM_SSM_CONV_STATE_LAYOUT, value: DS}
+            - {name: UCX_TLS, value: "${UCX_TLS}"}
+            # host-network prefill: the route to the decode pods is the cni0 bridge, which UCX skips by default
+            - {name: UCX_TCP_BRIDGE_ENABLE, value: "y"}
+            # the CUDA-13 UCX build inside the nixl wheel (cuda_copy / cuda_ipc transports)
+            - {name: UCX_MODULE_DIR, value: /usr/local/lib/python3.12/dist-packages/nixl_cu13.libs/ucx}
+            - {name: MOONCAKE_CONFIG_PATH, value: /etc/mooncake/mooncake.json}
+            - {name: MC_GID_INDEX, value: "${MOONCAKE_GID_INDEX}"}   # RDMA only
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}
+          ports:
+            - {containerPort: ${PREFILL_PORT}, name: http}
+            - {containerPort: ${PREFILL_NIXL_PORT}, name: nixl}
+          readinessProbe:
+            httpGet: {path: /health, port: ${PREFILL_PORT}}
+            periodSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - {name: hf-cache, mountPath: /root/.cache/huggingface}
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: mooncake-client, mountPath: /etc/mooncake}
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              nvidia.com/gpumem: "${GPU_MEM_MIB}"
+              nvidia.com/gpucores: "${GPU_CORES}"
+      volumes:
+        - name: hf-cache
+          hostPath: {path: "${HF_CACHE_DIR}", type: DirectoryOrCreate}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+        - name: mooncake-client
+          configMap: {name: mooncake-client}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${PREFILL_NAME}-pods
+  labels: {stack: pd-gateway}
+spec:
+  clusterIP: None
+  selector: {app: vllm-prefill, prefill-set: ${PREFILL_NAME}}
+  ports:
+    - {name: http, port: ${PREFILL_PORT}}

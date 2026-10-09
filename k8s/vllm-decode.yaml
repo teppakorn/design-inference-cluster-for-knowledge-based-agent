@@ -1,0 +1,116 @@
+# Decode pool (2 pods) = llm-d routing sidecar + vLLM.
+#
+#   gateway --(x-prefiller-host-port: <prefill pod>)--> sidecar :8000
+#   sidecar --(prefill leg: max_tokens=1, kv_transfer_params.do_remote_decode)--> prefill vLLM
+#   sidecar --(decode leg: the original request + kv_transfer_params from prefill)--> localhost:8200
+#   decode vLLM --(its free block ids, NIXL notification)--> prefill vLLM
+#   prefill vLLM --(NIXL WRITE over UCX cuda_ipc)--> these blocks
+# The sidecar only orders the two HTTP legs; the KV bytes move between the two vLLM engines.
+# The sidecar is a native sidecar (initContainer + restartPolicy: Always), as in llm-d's P/D guide.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decode
+  labels: {app: vllm-decode, stack: pd-gateway, role: decode}
+spec:
+  replicas: 2
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: vllm-decode}
+  template:
+    metadata:
+      labels: {app: vllm-decode, stack: pd-gateway, role: decode}
+      annotations:
+        nvidia.com/use-gpuuuid: "${GPU_UUID}"   # all 4 slices on ONE GPU (HAMi)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8200"
+        prometheus.io/path: /metrics
+    spec:
+      schedulerName: hami-scheduler
+      # CUDA IPC between pods on the same GPU needs the host IPC + PID namespaces
+      hostIPC: ${PD_HOST_NS}
+      hostPID: ${PD_HOST_NS}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: routing-proxy
+          image: ${SIDECAR_IMAGE}
+          args:
+            - --port=8000
+            - --kv-connector=nixlv2
+            - --secure-proxy=false
+            - --zap-log-level=1
+          ports:
+            - {containerPort: 8000, name: sidecar}
+          restartPolicy: Always
+          readinessProbe:
+            tcpSocket: {port: 8000}
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          args:
+            - ${MODEL}
+            - --served-model-name=${SERVED_MODEL_NAME}
+            - --host=0.0.0.0
+            - --port=8200
+            - --max-num-seqs=${MAX_NUM_SEQS}
+            - --enable-chunked-prefill
+            - --max-num-batched-tokens=${MAX_NUM_BATCHED_TOKENS}
+            - --enable-prefix-caching
+            - --max-model-len=${MAX_MODEL_LEN}
+            - --gpu-memory-utilization=${GPU_MEM_UTIL}
+            - --enable-auto-tool-choice
+            - --tool-call-parser=${TOOL_PARSER}
+            - --enable-prompt-tokens-details
+            - --disable-access-log-for-endpoints=/health,/metrics,/v1/models
+            ${VLLM_EXTRA_ARGS_YAML}
+            - '--kv-transfer-config=${DECODE_KV_CONFIG}'
+          env:
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: VLLM_NIXL_SIDE_CHANNEL_PORT, value: "5600"}
+            - {name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE, value: "120"}
+            - {name: PYTHONHASHSEED, value: "0"}
+            - {name: VLLM_SSM_CONV_STATE_LAYOUT, value: DS}
+            - {name: UCX_TLS, value: "${UCX_TLS}"}
+            - {name: UCX_MODULE_DIR, value: /usr/local/lib/python3.12/dist-packages/nixl_cu13.libs/ucx}
+            - {name: MOONCAKE_CONFIG_PATH, value: /etc/mooncake/mooncake.json}
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}
+          ports:
+            - {containerPort: 8200, name: http}
+            - {containerPort: 5600, name: nixl}
+          readinessProbe:
+            httpGet: {path: /health, port: 8200}
+            periodSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - {name: hf-cache, mountPath: /root/.cache/huggingface}
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: mooncake-client, mountPath: /etc/mooncake}
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              nvidia.com/gpumem: "${GPU_MEM_MIB}"
+              nvidia.com/gpucores: "${GPU_CORES}"
+      volumes:
+        - name: hf-cache
+          hostPath: {path: "${HF_CACHE_DIR}", type: DirectoryOrCreate}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+        - name: mooncake-client
+          configMap: {name: mooncake-client}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-decode-pods
+  labels: {stack: pd-gateway}
+spec:
+  clusterIP: None
+  selector: {app: vllm-decode}
+  ports:
+    - {name: sidecar, port: 8000}

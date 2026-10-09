@@ -1,0 +1,68 @@
+# Open WebUI: a ChatGPT-like web page in front of the gateway, to try the stack by hand.
+# It talks to the gateway's OpenAI API (pd-gateway:8080/v1) like any other client, so every chat
+# goes through admission, queue and router. Chats live in WEBUI_DATA_DIR on the host.
+# The ConfigMap open-webui-extra (scripts/webui.sh) adds the wiki tools when WIKI_DIR is set:
+# TOOL_SERVER_CONNECTIONS, DEFAULT_MODEL_METADATA, DEFAULT_MODEL_PARAMS (wiki_tools/openwebui.py).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  labels: {app: open-webui, stack: pd-gateway-ui}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # one SQLite database on a host folder
+  selector:
+    matchLabels: {app: open-webui}
+  template:
+    metadata:
+      labels: {app: open-webui, stack: pd-gateway-ui}
+      annotations:
+        pd-gateway/config-hash: "${WEBUI_CONFIG_HASH}"   # restarts the pod when the extra settings change
+    spec:
+      containers:
+        - name: webui
+          image: ${WEBUI_IMAGE}
+          envFrom:
+            - configMapRef: {name: open-webui-extra, optional: true}
+          env:
+            # settings come from these env vars on every start (otherwise only the first start counts and later
+            # changes here are ignored); changes made in the admin pages last until the pod restarts
+            - {name: ENABLE_PERSISTENT_CONFIG, value: "false"}
+            # WEBUI_AUTH=false: no login, everyone is the same user (only on a fresh data folder; see README)
+            - {name: WEBUI_AUTH, value: "${WEBUI_AUTH}"}
+            - {name: ENABLE_OLLAMA_API, value: "false"}
+            - {name: ENABLE_OPENAI_API, value: "true"}
+            - {name: OPENAI_API_BASE_URLS, value: "http://pd-gateway:8080/v1"}
+            - {name: OPENAI_API_KEYS, value: "unused"}
+            - {name: DEFAULT_MODELS, value: "${SERVED_MODEL_NAME}"}
+            # send X-OpenWebUI-User-Id with every call: the gateway uses it as the tenant
+            - {name: ENABLE_FORWARD_USER_INFO_HEADERS, value: "true"}
+            # background calls Open WebUI would make around every answer (title, tags, follow-ups, autocomplete).
+            # Each one is a full model call, and a thinking model can spend its whole budget thinking: a title
+            # call used 1,000 tokens of thinking and returned no title. Chats are named after the first message.
+            - {name: ENABLE_TITLE_GENERATION, value: "false"}
+            - {name: ENABLE_TAGS_GENERATION, value: "false"}
+            - {name: ENABLE_FOLLOW_UP_GENERATION, value: "false"}
+            - {name: ENABLE_AUTOCOMPLETE_GENERATION, value: "false"}
+          ports:
+            - {containerPort: 8080, name: http}
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 30
+          volumeMounts:
+            - {name: data, mountPath: /app/backend/data}
+      volumes:
+        - name: data
+          hostPath: {path: "${WEBUI_DATA_DIR}", type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  labels: {stack: pd-gateway-ui}
+spec:
+  type: NodePort
+  selector: {app: open-webui}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080, nodePort: ${WEBUI_PORT}}

@@ -1,0 +1,69 @@
+# Mooncake Store master: the metadata / allocation service of the shared prefix-KV pool.
+# The KV bytes do not live here: each prefill pod lends MOONCAKE_SEGMENT of its own host RAM
+# ("embedded" mode) and Mooncake's transfer engine moves blocks between pods (RDMA or TCP).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-master
+  labels: {app: mooncake-master, stack: pd-gateway}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: mooncake-master}
+  template:
+    metadata:
+      labels: {app: mooncake-master, stack: pd-gateway}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9003"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: master
+          image: ${MOONCAKE_IMAGE}
+          command: ["mooncake_master"]
+          args:
+            - --rpc_port=50051
+            - --metrics_port=9003
+            - --enable_metric_reporting=true
+            - --eviction_high_watermark_ratio=0.9
+            - --eviction_ratio=0.1
+            - --default_kv_lease_ttl=10000
+          ports:
+            - {containerPort: 50051, name: rpc}
+            - {containerPort: 9003, name: metrics}
+          readinessProbe:
+            tcpSocket: {port: 50051}
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-master
+  labels: {stack: pd-gateway}
+spec:
+  selector: {app: mooncake-master}
+  ports:
+    - {name: rpc, port: 50051, targetPort: 50051}
+    - {name: metrics, port: 9003, targetPort: 9003}
+---
+# MooncakeStoreConnector client config (MOONCAKE_CONFIG_PATH). P2PHANDSHAKE = no separate
+# metadata server; peers exchange segment info directly.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mooncake-client
+  labels: {stack: pd-gateway}
+data:
+  mooncake.json: |
+    {
+      "mode": "embedded",
+      "metadata_server": "P2PHANDSHAKE",
+      "master_server_address": "mooncake-master:50051",
+      "protocol": "${MOONCAKE_PROTOCOL}",
+      "device_name": "${MOONCAKE_DEVICE}",
+      "global_segment_size": "${MOONCAKE_SEGMENT}",
+      "local_buffer_size": "${MOONCAKE_LOCAL_BUFFER}",
+      "enable_offload": false
+    }

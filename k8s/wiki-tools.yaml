@@ -1,0 +1,49 @@
+# wiki-tools (wiki_tools/server.py): the Markdown wiki in WIKI_DIR as an OpenAPI tool server for Open WebUI
+# (search_wiki, read_note, list_tags). Open WebUI's backend calls it at http://wiki-tools:8000.
+# Started by scripts/webui.sh when WIKI_DIR is set; the wiki folder is mounted read-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wiki-tools
+  labels: {app: wiki-tools, stack: pd-gateway-ui}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wiki-tools}
+  template:
+    metadata:
+      labels: {app: wiki-tools, stack: pd-gateway-ui}
+    spec:
+      containers:
+        - name: wiki-tools
+          image: ${GATEWAY_IMAGE}
+          workingDir: /lab
+          command: ["sh", "-c", "pip install -q --root-user-action=ignore -r wiki_tools/requirements.txt && exec python -m wiki_tools.server"]
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: WIKI_DIR, value: /wiki}
+            - {name: WIKI_DESCRIPTION, value: "${WIKI_DESCRIPTION}"}
+          ports:
+            - {containerPort: 8000, name: http}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: lab, mountPath: /lab, readOnly: true}
+            - {name: wiki, mountPath: /wiki, readOnly: true}
+      volumes:
+        - name: lab
+          hostPath: {path: "${HOST_ROOT}", type: Directory}
+        - name: wiki
+          hostPath: {path: "${WIKI_DIR}", type: Directory}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wiki-tools
+  labels: {stack: pd-gateway-ui}
+spec:
+  selector: {app: wiki-tools}
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}

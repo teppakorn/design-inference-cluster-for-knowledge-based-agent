@@ -1,0 +1,68 @@
+# pd-gateway (gateway/*.py): the one OpenAI-compatible endpoint clients talk to.
+# python:3.12-slim + this folder mounted from the host (single-node setup), on hostPort GATEWAY_PORT.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-gateway
+  labels: {app: pd-gateway, stack: pd-gateway}
+spec:
+  replicas: 1
+  # hostPort + RollingUpdate deadlocks on one node (the new pod waits for the old pod's port)
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: pd-gateway}
+  template:
+    metadata:
+      labels: {app: pd-gateway, stack: pd-gateway}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: gateway
+          image: ${GATEWAY_IMAGE}
+          workingDir: /lab
+          command: ["sh", "-c", "pip install -q --root-user-action=ignore -r gateway/requirements.txt && exec python -m gateway.server"]
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: SAMPLING_DEFAULTS, value: '${SAMPLING_DEFAULTS_JSON}'}
+            # comma list of dns:port (host-network prefill has one service per pod)
+            - {name: PREFILL_DNS, value: "${PREFILL_TARGETS}"}
+            - {name: DECODE_DNS, value: "vllm-decode-pods:8000"}
+            - {name: ROUTER_POLICY, value: "${ROUTER_POLICY}"}
+            # one slot per running sequence of a decode pod
+            - {name: QUEUE_POLICY, value: "${QUEUE_POLICY}"}
+            - {name: QUEUE_SLOTS, value: "${MAX_NUM_SEQS}"}
+            - {name: LONG_PROMPT_TOKENS, value: "${LONG_PROMPT_TOKENS}"}
+            - {name: QUEUE_CLASS_WEIGHTS, value: "${QUEUE_CLASS_WEIGHTS}"}
+            - {name: ADMISSION, value: "${ADMISSION}"}
+            - {name: SLO_S, value: "${SLO_S}"}
+            - {name: SLO_OUT_QUANTILE, value: "${SLO_OUT_QUANTILE}"}
+            - {name: SLO_DRAIN, value: "${SLO_DRAIN}"}
+            - {name: BUCKET_TOKENS_PER_S, value: "${BUCKET_TOKENS_PER_S}"}
+            - {name: BUCKET_BURST, value: "${BUCKET_BURST}"}
+            - {name: BUCKET_OUTPUT_RESERVE, value: "${BUCKET_OUTPUT_RESERVE}"}
+            - {name: KV_SATURATION, value: "${KV_SATURATION}"}
+            - {name: CACHE_SALT, value: "${CACHE_SALT}"}
+            - {name: TRACE_DIR, value: "${TRACE_DIR}"}
+          ports:
+            - {containerPort: 8080, hostPort: ${GATEWAY_PORT}, name: http}
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: lab, mountPath: /lab}
+      volumes:
+        - name: lab
+          hostPath: {path: "${HOST_ROOT}", type: Directory}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-gateway
+  labels: {stack: pd-gateway}
+spec:
+  selector: {app: pd-gateway}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}

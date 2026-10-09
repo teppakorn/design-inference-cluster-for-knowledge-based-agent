@@ -1,0 +1,26 @@
+server:
+  persistentVolume:
+    enabled: false
+  global:
+    # 5 s so a load test of a few minutes still gets a usable curve in Grafana
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    evaluation_interval: 15s
+
+# vLLM, gateway and Mooncake pods are picked up by the chart's default
+# "kubernetes-pods" job through their prometheus.io/* annotations.
+extraScrapeConfigs: |
+  - job_name: hami
+    static_configs:
+      - targets:
+          - hami-device-plugin-monitor.kube-system.svc.cluster.local:31992
+          - hami-scheduler.kube-system.svc.cluster.local:31993
+
+alertmanager:
+  enabled: false
+kube-state-metrics:
+  enabled: true
+prometheus-node-exporter:
+  enabled: true
+prometheus-pushgateway:
+  enabled: false
